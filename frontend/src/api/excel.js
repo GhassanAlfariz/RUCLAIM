@@ -45,3 +45,13 @@ export async function deleteHistory(id) {
   const { data } = await api.delete(`/history/${id}`)
   return data
 }
+
+/**
+ * Ambil preview isi data kolom target dari file Excel.
+ * @param {number} id
+ * @returns {{ [targetName]: { column_name: string, values: string[] } }}
+ */
+export async function fetchColumnPreview(id) {
+  const { data } = await api.get(`/history/${id}/preview`)
+  return data
+}

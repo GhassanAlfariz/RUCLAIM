@@ -45,6 +45,8 @@ TARGET_COLUMNS: list[dict] = [
     {
         "name": "Start Date",
         "patterns": [
+            r"reins(urance)?[\s_\-\.]*period[\s_\-\.]*from",  # REINS PERIOD FROM (double-header)
+            r"period[\s_\-\.]*from",                           # PERIOD FROM
             r"start[\s_\-\.]*date",
             r"date[\s_\-\.]*start",
             r"effective[\s_\-\.]*date",
@@ -52,28 +54,26 @@ TARGET_COLUMNS: list[dict] = [
             r"tgl[\s_\-\.]*mulai",
             r"tanggal[\s_\-\.]*mulai",
             r"inception[\s_\-\.]*date",
-            r"\bfrom\b",                          # FROM (periode)
             r"from[\s_\-\.]*date",
-            r"reins[\s_\-\.]*period[\s_\-\.]*from",
-            r"period[\s_\-\.]*from",
+            r"^from$",                            # standalone FROM
         ],
     },
     {
         "name": "End Date",
         "patterns": [
+            r"reins(urance)?[\s_\-\.]*period[\s_\-\.]*to",    # REINS PERIOD TO (double-header)
+            r"period[\s_\-\.]*to",                             # PERIOD TO
             r"end[\s_\-\.]*date",
             r"date[\s_\-\.]*end",
             r"expiry[\s_\-\.]*date",
             r"expiration[\s_\-\.]*date",
             r"tgl[\s_\-\.]*akhir",
             r"tanggal[\s_\-\.]*akhir",
-            r"\bto\b",                            # TO (periode)
             r"to[\s_\-\.]*date",
-            r"reins[\s_\-\.]*period[\s_\-\.]*to",
-            r"period[\s_\-\.]*to",
-            r"due[\s_\-\.]*date",                 # due date → End Date
+            r"due[\s_\-\.]*date",
             r"maturity[\s_\-\.]*date",
             r"closing[\s_\-\.]*date",
+            r"^to$",                              # standalone TO
         ],
     },
     {
@@ -189,6 +189,7 @@ class MatchResult:
 def analyze_columns(headers: list[str]) -> MatchResult:
     """
     Analisis semua header dari satu sheet Excel.
+    Setiap kolom target hanya diambil SATU KALI (match pertama yang ditemukan).
 
     Args:
         headers: daftar nama kolom dari DataFrame (df.columns.tolist())
@@ -201,18 +202,19 @@ def analyze_columns(headers: list[str]) -> MatchResult:
 
     for header in headers:
         if not isinstance(header, str) or not header.strip():
-            # Lewati kolom kosong / non-string (unnamed)
             result.irrelevant.append(str(header))
             continue
 
         target = match_column(header)
-        if target:
+        if target and target not in found_targets:
+            # Belum ada yang match ke target ini — ambil
             result.matched.append({
                 "column_name": header,
                 "mapped_to": target,
             })
             found_targets.add(target)
         else:
+            # Sudah ada yang match, atau tidak cocok target manapun
             result.irrelevant.append(header)
 
     # Kolom target yang tidak ditemukan sama sekali

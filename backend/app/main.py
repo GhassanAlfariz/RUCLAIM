@@ -44,7 +44,7 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 # ============================================================
 # ENDPOINT: Upload Excel
 # ============================================================
-@app.post("/upload", response_model=UploadResponseOut, tags=["Upload"])
+@app.post("/upload", tags=["Upload"])
 async def upload_excel(
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
@@ -75,27 +75,72 @@ async def upload_excel(
         xl         = pd.ExcelFile(file_path)
         sheet_name = xl.sheet_names[0]
 
-        # --- Auto-detect baris header yang sebenarnya ---
-        # Banyak file Excel punya judul/info di baris atas sebelum header kolom.
-        # Strategi: scan tiap baris, cari baris pertama yang punya
-        # >= MIN_REAL_COLS kolom terisi (non-NaN, non-empty).
-        MIN_REAL_COLS = 4   # minimal 4 kolom terisi agar dianggap baris header
+        MIN_REAL_COLS = 4
 
-        df_raw = xl.parse(sheet_name, header=None)
-        header_row = 0  # default fallback
+        df_raw = xl.parse(sheet_name, header=None, dtype=str)
+        header_row = 0
 
         for i, row in df_raw.iterrows():
             filled = [
                 c for c in row
-                if pd.notna(c) and str(c).strip() != ""
+                if pd.notna(c) and str(c).strip() not in ("", "nan")
             ]
             if len(filled) >= MIN_REAL_COLS:
                 header_row = i
                 break
 
-        # Parse ulang dengan header di baris yang terdeteksi
-        df      = xl.parse(sheet_name, header=header_row)
-        headers = [str(c).strip() for c in df.columns.tolist()]
+        # --- Deteksi double-header ---
+        # Cek baris tepat setelah header_row: jika >= 2 sel terisi DAN
+        # semua isinya kata pendek (<=12 karakter), kemungkinan baris sub-header.
+        # Kalau iya, gabungkan parent + sub sebagai nama kolom.
+        def _is_subheader_row(row_series) -> bool:
+            vals = [str(v).strip() for v in row_series
+                    if pd.notna(v) and str(v).strip() not in ("", "nan")]
+            return (2 <= len(vals) <= 10 and
+                    all(len(v) <= 15 for v in vals))
+
+        next_row_idx = header_row + 1
+        use_double = (
+            next_row_idx < len(df_raw) and
+            _is_subheader_row(df_raw.iloc[next_row_idx])
+        )
+
+        if use_double:
+            # Baris 1: parent headers (dengan forward-fill untuk merged cells)
+            row1 = df_raw.iloc[header_row].tolist()
+            row2 = df_raw.iloc[next_row_idx].tolist()
+
+            # Forward-fill parent header (merged cell jadi NaN di kolom berikutnya)
+            last_parent = ""
+            parent_filled = []
+            for v in row1:
+                vs = str(v).strip() if pd.notna(v) and str(v).strip() not in ("nan",) else ""
+                if vs:
+                    last_parent = vs
+                else:
+                    vs = last_parent   # fill dari parent sebelumnya (merged cell)
+                parent_filled.append(vs)
+
+            headers = []
+            for p, s in zip(parent_filled, row2):
+                ss = str(s).strip() if pd.notna(s) and str(s).strip() not in ("", "nan") else ""
+                if ss:
+                    headers.append(f"{p} {ss}".strip())
+                else:
+                    headers.append(p)
+
+            # Baca data mulai dari baris setelah sub-header
+            df = xl.parse(sheet_name, header=None, dtype=str,
+                          skiprows=list(range(next_row_idx + 1)))
+            df.columns = headers[:len(df.columns)]
+        else:
+            df      = xl.parse(sheet_name, header=header_row, dtype=str)
+            headers = [str(c).strip() for c in df.columns.tolist()]
+
+        # Bersihkan nama kolom dari suffix pandas duplikat (.1, .2, ...)
+        import re as _re
+        headers = [_re.sub(r'\.\d+$', '', h).strip() for h in headers]
+        df.columns = headers[:len(df.columns)]
 
     except Exception as e:
         os.remove(file_path)
@@ -117,17 +162,39 @@ async def upload_excel(
         result=result,
     )
 
-    return UploadResponseOut(
-        message="File berhasil diproses.",
-        upload_id=upload.id,
-        original_name=file.filename,
-        sheet_name=sheet_name,
-        total_columns=len(headers),
-        status=upload.status,
-        matched=result.matched,
-        missing=result.missing,
-        irrelevant=result.irrelevant,
-    )
+    # Buat mapping: excel_col_name -> target_name
+    col_map = {m["column_name"]: m["mapped_to"] for m in result.matched}
+
+    # Ambil isi data per kolom target yang matched
+    # rows: list of dict { target_name: value, ... } — satu dict per baris
+    MAX_ROWS = 1000  # batasi agar response tidak terlalu besar
+    rows = []
+    for _, row in df.head(MAX_ROWS).iterrows():
+        row_dict = {}
+        for excel_col, target_name in col_map.items():
+            if excel_col in df.columns:
+                val = row[excel_col]
+                # dtype=str: NaN jadi string "nan" atau "NaT", strip dan kosongkan
+                val_str = "" if (pd.isna(val) if not isinstance(val, str) else False) else str(val).strip()
+                if val_str.lower() in ("nan", "nat", "none"):
+                    val_str = ""
+                row_dict[target_name] = val_str
+        rows.append(row_dict)
+
+    return {
+        "message": "File berhasil diproses.",
+        "upload_id": upload.id,
+        "original_name": file.filename,
+        "sheet_name": sheet_name,
+        "total_columns": len(headers),
+        "status": upload.status,
+        "matched": result.matched,
+        "missing": result.missing,
+        "irrelevant": result.irrelevant,
+        "rows": rows,
+        # header mapping: target_name -> excel col name asli
+        "col_headers": {m["mapped_to"]: m["column_name"] for m in result.matched},
+    }
 
 
 # ============================================================
@@ -182,6 +249,66 @@ def get_history_detail(upload_id: int, db: Session = Depends(get_db)):
         missing=missing,
         irrelevant=irrelevant,
     )
+
+
+# ============================================================
+# ENDPOINT: Preview isi data kolom target dari file Excel
+# ============================================================
+@app.get("/history/{upload_id}/preview", tags=["History"])
+def get_column_preview(upload_id: int, db: Session = Depends(get_db)):
+    """
+    Baca kembali file Excel dan kembalikan isi data (semua baris)
+    untuk setiap kolom target yang berhasil di-match.
+    Response: { "Police No": ["val1","val2",...], "Certif": [...], ... }
+    """
+    upload = crud.get_upload_by_id(db, upload_id)
+    if not upload:
+        raise HTTPException(status_code=404, detail="Upload tidak ditemukan.")
+
+    file_path = os.path.join(UPLOAD_DIR, upload.filename)
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="File Excel sudah tidak tersedia di server.")
+
+    try:
+        xl = pd.ExcelFile(file_path)
+        sheet_name = upload.sheet_name or xl.sheet_names[0]
+
+        MIN_REAL_COLS = 4
+        df_raw = xl.parse(sheet_name, header=None, dtype=str)
+        header_row = 0
+        for i, row in df_raw.iterrows():
+            filled = [c for c in row if pd.notna(c) and str(c).strip() not in ("", "nan")]
+            if len(filled) >= MIN_REAL_COLS:
+                header_row = i
+                break
+
+        df = xl.parse(sheet_name, header=header_row, dtype=str)
+        df.columns = [str(c).strip() for c in df.columns]
+
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=f"Gagal membaca file: {str(e)}")
+
+    # Ambil kolom matched dari DB → { column_name_excel: mapped_to_target }
+    matched_cols = {
+        c.column_name: c.mapped_to
+        for c in upload.columns
+        if c.category == "matched"
+    }
+
+    preview = {}
+    for excel_col, target_name in matched_cols.items():
+        if excel_col in df.columns:
+            # dtype=str: semua sudah string, bersihkan "nan"/"NaT" jadi ""
+            values = [
+                "" if (v.strip().lower() in ("nan", "nat", "none", "")) else v.strip()
+                for v in df[excel_col].fillna("").astype(str).tolist()
+            ]
+            preview[target_name] = {
+                "column_name": excel_col,
+                "values": values,
+            }
+
+    return preview
 
 
 # ============================================================

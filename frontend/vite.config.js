@@ -8,7 +8,7 @@ export default defineConfig({
     proxy: {
       // Proxy ke FastAPI backend agar tidak kena CORS saat dev
       '/api': {
-        target: 'http://localhost:8080',
+        target: 'http://localhost:8000',
         changeOrigin: true,
         rewrite: (path) => path.replace(/^\/api/, ''),
       },
