@@ -165,19 +165,25 @@ async def upload_excel(
     # Buat mapping: excel_col_name -> target_name
     col_map = {m["column_name"]: m["mapped_to"] for m in result.matched}
 
+    def _clean_val(v: str) -> str:
+        """Bersihkan nilai: hapus 00:00:00 dari datetime string, strip nan."""
+        s = str(v).strip() if not isinstance(v, float) else ""
+        if s.lower() in ("nan", "nat", "none", ""):
+            return ""
+        # Hapus bagian waktu ' 00:00:00' atau 'T00:00:00' jika ada
+        import re as _re2
+        s = _re2.sub(r'[\sT]00:00:00(\.\d+)?$', '', s).strip()
+        return s
+
     # Ambil isi data per kolom target yang matched
-    # rows: list of dict { target_name: value, ... } — satu dict per baris
-    MAX_ROWS = 1000  # batasi agar response tidak terlalu besar
+    MAX_ROWS = 1000
     rows = []
     for _, row in df.head(MAX_ROWS).iterrows():
         row_dict = {}
         for excel_col, target_name in col_map.items():
             if excel_col in df.columns:
                 val = row[excel_col]
-                # dtype=str: NaN jadi string "nan" atau "NaT", strip dan kosongkan
-                val_str = "" if (pd.isna(val) if not isinstance(val, str) else False) else str(val).strip()
-                if val_str.lower() in ("nan", "nat", "none"):
-                    val_str = ""
+                val_str = "" if (pd.isna(val) if not isinstance(val, str) else False) else _clean_val(val)
                 row_dict[target_name] = val_str
         rows.append(row_dict)
 
@@ -298,11 +304,15 @@ def get_column_preview(upload_id: int, db: Session = Depends(get_db)):
     preview = {}
     for excel_col, target_name in matched_cols.items():
         if excel_col in df.columns:
-            # dtype=str: semua sudah string, bersihkan "nan"/"NaT" jadi ""
-            values = [
-                "" if (v.strip().lower() in ("nan", "nat", "none", "")) else v.strip()
-                for v in df[excel_col].fillna("").astype(str).tolist()
-            ]
+            # dtype=str: semua sudah string, bersihkan "nan"/"NaT" dan " 00:00:00"
+            import re as _re2
+            def _clean(v):
+                s = str(v).strip()
+                if s.lower() in ("nan", "nat", "none", ""):
+                    return ""
+                s = _re2.sub(r'[\sT]00:00:00(\.\d+)?$', '', s).strip()
+                return s
+            values = [_clean(v) for v in df[excel_col].fillna("").astype(str).tolist()]
             preview[target_name] = {
                 "column_name": excel_col,
                 "values": values,

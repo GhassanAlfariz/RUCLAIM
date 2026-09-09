@@ -21,6 +21,28 @@ export async function uploadExcel(file, onProgress) {
 }
 
 /**
+ * Upload banyak file Excel sekaligus (satu per satu ke backend).
+ * @param {File[]} files
+ * @param {function} onFileProgress - callback (fileIndex, percent)
+ * @param {function} onFileDone    - callback (fileIndex, result|error)
+ */
+export async function uploadMultipleExcel(files, onFileProgress, onFileDone) {
+  const results = []
+  for (let i = 0; i < files.length; i++) {
+    try {
+      const result = await uploadExcel(files[i], (pct) => onFileProgress?.(i, pct))
+      onFileDone?.(i, { status: 'success', data: result })
+      results.push({ status: 'success', data: result })
+    } catch (err) {
+      const msg = err.response?.data?.detail ?? err.message ?? 'Gagal'
+      onFileDone?.(i, { status: 'error', message: msg })
+      results.push({ status: 'error', message: msg })
+    }
+  }
+  return results
+}
+
+/**
  * Ambil daftar semua riwayat upload (ringkasan).
  */
 export async function fetchHistory() {
