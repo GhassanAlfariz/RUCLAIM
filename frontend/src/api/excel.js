@@ -11,6 +11,7 @@ export async function uploadExcel(file, onProgress) {
 
   const { data } = await api.post('/upload', form, {
     headers: { 'Content-Type': 'multipart/form-data' },
+    timeout: 300000, // 5 menit — file besar butuh waktu lebih lama
     onUploadProgress: (e) => {
       if (onProgress && e.total) {
         onProgress(Math.round((e.loaded * 100) / e.total))

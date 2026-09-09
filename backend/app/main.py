@@ -3,11 +3,16 @@ FastAPI entry point — RU Claim Excel Column Extractor API
 """
 
 import os
+import re
 import uuid
+import logging
+import traceback
 import pandas as pd
 from fastapi import FastAPI, UploadFile, File, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
+
+logger = logging.getLogger("ruclaim")
 
 from app.database import engine, Base, get_db
 from app.column_matcher import analyze_columns
@@ -30,7 +35,7 @@ app.add_middleware(
         "http://localhost:5173",
         "http://127.0.0.1:5173",
         "http://localhost:3000",
-        "http://localhost:8080",
+        "http://localhost:8000",
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -70,29 +75,35 @@ async def upload_excel(
     with open(file_path, "wb") as f:
         f.write(contents)
 
-    # Baca Excel dengan pandas
     try:
+        # ── Baca Excel ──────────────────────────────────────────
         xl         = pd.ExcelFile(file_path)
         sheet_name = xl.sheet_names[0]
 
         MIN_REAL_COLS = 4
-
+        SCAN_ROWS     = 30   # scan maksimal 30 baris pertama untuk cari header
         df_raw = xl.parse(sheet_name, header=None, dtype=str)
-        header_row = 0
 
-        for i, row in df_raw.iterrows():
+        # Cari header row: baris dengan kolom terisi TERBANYAK di 30 baris pertama.
+        # Ini lebih robust daripada "baris pertama dengan ≥ 4 kolom" karena file
+        # kadang punya baris judul/info di atas header asli.
+        header_row  = 0
+        best_filled = 0
+        scan_limit  = min(SCAN_ROWS, len(df_raw))
+        for i in range(scan_limit):
+            row = df_raw.iloc[i]
             filled = [
                 c for c in row
                 if pd.notna(c) and str(c).strip() not in ("", "nan")
             ]
-            if len(filled) >= MIN_REAL_COLS:
-                header_row = i
-                break
+            if len(filled) > best_filled:
+                best_filled = len(filled)
+                header_row  = i
 
-        # --- Deteksi double-header ---
-        # Cek baris tepat setelah header_row: jika >= 2 sel terisi DAN
-        # semua isinya kata pendek (<=12 karakter), kemungkinan baris sub-header.
-        # Kalau iya, gabungkan parent + sub sebagai nama kolom.
+        if best_filled < MIN_REAL_COLS:
+            raise ValueError(f"Tidak ditemukan baris header yang valid (kolom terisi < {MIN_REAL_COLS}).")
+
+        # ── Deteksi double-header ────────────────────────────────
         def _is_subheader_row(row_series) -> bool:
             vals = [str(v).strip() for v in row_series
                     if pd.notna(v) and str(v).strip() not in ("", "nan")]
@@ -106,11 +117,9 @@ async def upload_excel(
         )
 
         if use_double:
-            # Baris 1: parent headers (dengan forward-fill untuk merged cells)
             row1 = df_raw.iloc[header_row].tolist()
             row2 = df_raw.iloc[next_row_idx].tolist()
 
-            # Forward-fill parent header (merged cell jadi NaN di kolom berikutnya)
             last_parent = ""
             parent_filled = []
             for v in row1:
@@ -118,18 +127,14 @@ async def upload_excel(
                 if vs:
                     last_parent = vs
                 else:
-                    vs = last_parent   # fill dari parent sebelumnya (merged cell)
+                    vs = last_parent
                 parent_filled.append(vs)
 
             headers = []
             for p, s in zip(parent_filled, row2):
                 ss = str(s).strip() if pd.notna(s) and str(s).strip() not in ("", "nan") else ""
-                if ss:
-                    headers.append(f"{p} {ss}".strip())
-                else:
-                    headers.append(p)
+                headers.append(f"{p} {ss}".strip() if ss else p)
 
-            # Baca data mulai dari baris setelah sub-header
             df = xl.parse(sheet_name, header=None, dtype=str,
                           skiprows=list(range(next_row_idx + 1)))
             df.columns = headers[:len(df.columns)]
@@ -137,55 +142,55 @@ async def upload_excel(
             df      = xl.parse(sheet_name, header=header_row, dtype=str)
             headers = [str(c).strip() for c in df.columns.tolist()]
 
-        # Bersihkan nama kolom dari suffix pandas duplikat (.1, .2, ...)
-        import re as _re
-        headers = [_re.sub(r'\.\d+$', '', h).strip() for h in headers]
+        # Bersihkan suffix pandas duplikat (.1, .2, ...)
+        headers = [re.sub(r'\.\d+$', '', h).strip() for h in headers]
         df.columns = headers[:len(df.columns)]
 
-    except Exception as e:
-        os.remove(file_path)
-        raise HTTPException(
-            status_code=422,
-            detail=f"Gagal membaca file Excel: {str(e)}",
+        # ── Analisis kolom ───────────────────────────────────────
+        result = analyze_columns(headers)
+
+        # ── Simpan ke DB ─────────────────────────────────────────
+        upload = crud.save_upload_result(
+            db=db,
+            original_name=file.filename,
+            filename=unique_name,
+            sheet_name=sheet_name,
+            total_columns=len(headers),
+            result=result,
         )
 
-    # Analisis kolom
-    result = analyze_columns(headers)
+        # ── Bersihkan & ambil preview data ───────────────────────
+        def _clean_series(s: pd.Series) -> pd.Series:
+            s = s.fillna("").astype(str).str.strip()
+            s = s.where(~s.str.lower().isin(["nan", "nat", "none"]), "")
+            s = s.str.replace(r'[\sT]00:00:00(\.\d+)?$', '', regex=True).str.strip()
+            return s
 
-    # Simpan ke DB
-    upload = crud.save_upload_result(
-        db=db,
-        original_name=file.filename,
-        filename=unique_name,
-        sheet_name=sheet_name,
-        total_columns=len(headers),
-        result=result,
-    )
+        col_map   = {m["column_name"]: m["mapped_to"] for m in result.matched}
+        available = {ec: tn for ec, tn in col_map.items() if ec in df.columns}
 
-    # Buat mapping: excel_col_name -> target_name
-    col_map = {m["column_name"]: m["mapped_to"] for m in result.matched}
+        if available:
+            df_out = df[list(available.keys())].copy()
+            for col in df_out.columns:
+                df_out[col] = _clean_series(df_out[col])
+            df_out.rename(columns=available, inplace=True)
+            total_rows = len(df_out)
+            rows = df_out.head(500).to_dict(orient="records")
+        else:
+            rows       = []
+            total_rows = 0
 
-    def _clean_val(v: str) -> str:
-        """Bersihkan nilai: hapus 00:00:00 dari datetime string, strip nan."""
-        s = str(v).strip() if not isinstance(v, float) else ""
-        if s.lower() in ("nan", "nat", "none", ""):
-            return ""
-        # Hapus bagian waktu ' 00:00:00' atau 'T00:00:00' jika ada
-        import re as _re2
-        s = _re2.sub(r'[\sT]00:00:00(\.\d+)?$', '', s).strip()
-        return s
-
-    # Ambil isi data per kolom target yang matched
-    MAX_ROWS = 1000
-    rows = []
-    for _, row in df.head(MAX_ROWS).iterrows():
-        row_dict = {}
-        for excel_col, target_name in col_map.items():
-            if excel_col in df.columns:
-                val = row[excel_col]
-                val_str = "" if (pd.isna(val) if not isinstance(val, str) else False) else _clean_val(val)
-                row_dict[target_name] = val_str
-        rows.append(row_dict)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Upload error: %s\n%s", e, traceback.format_exc())
+        # Hapus file jika gagal diproses
+        if os.path.exists(file_path):
+            os.remove(file_path)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Gagal memproses file: {str(e)}",
+        )
 
     return {
         "message": "File berhasil diproses.",
@@ -193,12 +198,13 @@ async def upload_excel(
         "original_name": file.filename,
         "sheet_name": sheet_name,
         "total_columns": len(headers),
+        "total_rows": total_rows,
+        "preview_rows": len(rows),
         "status": upload.status,
         "matched": result.matched,
         "missing": result.missing,
         "irrelevant": result.irrelevant,
         "rows": rows,
-        # header mapping: target_name -> excel col name asli
         "col_headers": {m["mapped_to"]: m["column_name"] for m in result.matched},
     }
 
