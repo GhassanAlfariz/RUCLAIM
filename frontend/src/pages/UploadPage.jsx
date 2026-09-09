@@ -131,7 +131,11 @@ function ResultTable({ result }) {
       </div>
 
       <div className="flex items-center justify-between px-4 py-2 bg-slate-50 border-t border-slate-100 text-xs text-slate-500">
-        <span>{rows.length} baris data</span>
+        <span>
+          {result.total_rows > result.preview_rows
+            ? `Menampilkan ${rows.length} dari ${result.total_rows} baris`
+            : `${rows.length} baris data`}
+        </span>
         <span className="font-medium text-slate-600">{matched.length} dari 10 kolom ditemukan</span>
       </div>
     </div>
