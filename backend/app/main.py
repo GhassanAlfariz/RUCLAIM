@@ -90,27 +90,34 @@ async def upload_excel(
                 break
 
         # --- Deteksi double-header ---
-        # Cek baris tepat setelah header_row: jika >= 2 sel terisi DAN
-        # semua isinya kata pendek (<=12 karakter), kemungkinan baris sub-header.
-        # Kalau iya, gabungkan parent + sub sebagai nama kolom.
-        def _is_subheader_row(row_series) -> bool:
+        # Sub-header valid jika:
+        # - hanya 2-5 sel terisi (FROM, TO, OF BUILD, dst)
+        # - semua nilai sangat pendek (<= 12 karakter)
+        # - TIDAK semua nilai terisi (sparse, bukan baris data penuh)
+        def _is_subheader_row(row_series, total_cols: int) -> bool:
             vals = [str(v).strip() for v in row_series
                     if pd.notna(v) and str(v).strip() not in ("", "nan")]
-            return (2 <= len(vals) <= 10 and
-                    all(len(v) <= 15 for v in vals))
+            if not (2 <= len(vals) <= 5):
+                return False
+            if not all(len(v) <= 12 for v in vals):
+                return False
+            # Pastikan baris ini jauh lebih kosong daripada baris header
+            # (sub-header biasanya hanya isi 2-3 dari banyak kolom)
+            fill_ratio = len(vals) / max(total_cols, 1)
+            return fill_ratio < 0.3
 
         next_row_idx = header_row + 1
-        use_double = (
+        total_cols   = len(df_raw.columns)
+        use_double   = (
             next_row_idx < len(df_raw) and
-            _is_subheader_row(df_raw.iloc[next_row_idx])
+            _is_subheader_row(df_raw.iloc[next_row_idx], total_cols)
         )
 
         if use_double:
-            # Baris 1: parent headers (dengan forward-fill untuk merged cells)
             row1 = df_raw.iloc[header_row].tolist()
             row2 = df_raw.iloc[next_row_idx].tolist()
 
-            # Forward-fill parent header (merged cell jadi NaN di kolom berikutnya)
+            # Forward-fill parent header (merged cell → NaN di kolom berikutnya)
             last_parent = ""
             parent_filled = []
             for v in row1:
@@ -118,32 +125,31 @@ async def upload_excel(
                 if vs:
                     last_parent = vs
                 else:
-                    vs = last_parent   # fill dari parent sebelumnya (merged cell)
+                    vs = last_parent
                 parent_filled.append(vs)
 
             headers = []
             for p, s in zip(parent_filled, row2):
                 ss = str(s).strip() if pd.notna(s) and str(s).strip() not in ("", "nan") else ""
-                if ss:
-                    headers.append(f"{p} {ss}".strip())
-                else:
-                    headers.append(p)
+                headers.append(f"{p} {ss}".strip() if ss else p)
 
-            # Baca data mulai dari baris setelah sub-header
+            # Baca data — skip semua baris s.d. sub-header (inklusif)
+            data_start_row = next_row_idx + 1
             df = xl.parse(sheet_name, header=None, dtype=str,
-                          skiprows=list(range(next_row_idx + 1)))
+                          skiprows=list(range(data_start_row)))
             df.columns = headers[:len(df.columns)]
         else:
             df      = xl.parse(sheet_name, header=header_row, dtype=str)
             headers = [str(c).strip() for c in df.columns.tolist()]
 
-        # Bersihkan nama kolom dari suffix pandas duplikat (.1, .2, ...)
+        # Bersihkan suffix pandas duplikat (.1, .2, ...)
         import re as _re
         headers = [_re.sub(r'\.\d+$', '', h).strip() for h in headers]
         df.columns = headers[:len(df.columns)]
 
     except Exception as e:
-        os.remove(file_path)
+        if os.path.exists(file_path):
+            os.remove(file_path)
         raise HTTPException(
             status_code=422,
             detail=f"Gagal membaca file Excel: {str(e)}",
@@ -165,13 +171,20 @@ async def upload_excel(
     # Buat mapping: excel_col_name -> target_name
     col_map = {m["column_name"]: m["mapped_to"] for m in result.matched}
 
-    def _clean_val(v: str) -> str:
-        """Bersihkan nilai: hapus 00:00:00 dari datetime string, strip nan."""
-        s = str(v).strip() if not isinstance(v, float) else ""
+    import re as _re2
+
+    def _to_scalar(v):
+        """Pastikan v adalah scalar, bukan Series (terjadi saat nama kolom duplikat)."""
+        if hasattr(v, 'iloc'):
+            return v.iloc[0] if len(v) > 0 else ""
+        return v
+
+    def _clean_val(v) -> str:
+        """Bersihkan nilai: hapus 00:00:00, strip nan/NaT."""
+        v = _to_scalar(v)
+        s = str(v).strip()
         if s.lower() in ("nan", "nat", "none", ""):
             return ""
-        # Hapus bagian waktu ' 00:00:00' atau 'T00:00:00' jika ada
-        import re as _re2
         s = _re2.sub(r'[\sT]00:00:00(\.\d+)?$', '', s).strip()
         return s
 
@@ -182,9 +195,8 @@ async def upload_excel(
         row_dict = {}
         for excel_col, target_name in col_map.items():
             if excel_col in df.columns:
-                val = row[excel_col]
-                val_str = "" if (pd.isna(val) if not isinstance(val, str) else False) else _clean_val(val)
-                row_dict[target_name] = val_str
+                val = _to_scalar(row[excel_col])
+                row_dict[target_name] = _clean_val(val)
         rows.append(row_dict)
 
     return {
