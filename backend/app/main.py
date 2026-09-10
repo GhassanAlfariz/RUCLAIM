@@ -5,27 +5,57 @@ FastAPI entry point — RU Claim Excel Column Extractor API
 import os
 import re
 import uuid
+import math
 import logging
 import traceback
 import pandas as pd
+import numpy as np
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, UploadFile, File, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 
+# ── Logging: tampilkan ke terminal dengan format jelas ───────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
 logger = logging.getLogger("ruclaim")
 
-from app.database import engine, Base, get_db
+from app.database import engine, Base, get_db, check_db_connection, init_db
 from app.column_matcher import analyze_columns
 from app.schemas import UploadResponseOut, UploadSummaryOut, UploadDetailOut, ColumnResultOut
 from app import crud
 
-# Buat tabel jika belum ada
-Base.metadata.create_all(bind=engine)
+# Batas ukuran file: 50 MB
+MAX_FILE_SIZE = 50 * 1024 * 1024
+
+UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "..", "uploads")
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+
+# ── Startup / shutdown lifecycle ─────────────────────────────────────────────
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("=== RU Claim API starting up ===")
+    ok = init_db()
+    if not ok:
+        logger.warning(
+            "Tabel DB gagal dibuat saat startup. "
+            "Endpoint yang butuh DB akan error sampai koneksi pulih."
+        )
+    else:
+        logger.info("Database OK")
+    yield
+    logger.info("=== RU Claim API shutting down ===")
+
 
 app = FastAPI(
     title="RU Claim - Excel Column Extractor",
     version="1.0.0",
     description="Upload file Excel, deteksi kolom target, simpan ke riwayat.",
+    lifespan=lifespan,
 )
 
 # CORS — izinkan frontend dev server (React Vite default port 5173)
@@ -35,15 +65,75 @@ app.add_middleware(
         "http://localhost:5173",
         "http://127.0.0.1:5173",
         "http://localhost:3000",
-        "http://localhost:8000",
+        "http://localhost:8080",
     ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "..", "uploads")
-os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+# ── Helper: konversi nilai pandas/numpy ke tipe JSON-safe ───────────────────
+def _to_json_safe(val):
+    """Pastikan nilai bisa di-serialize ke JSON tanpa error."""
+    if val is None:
+        return None
+    if hasattr(val, "isoformat"):        # datetime, date, pd.Timestamp
+        return val.isoformat()
+    if isinstance(val, float):
+        if math.isnan(val) or math.isinf(val):
+            return None
+        return val
+    if isinstance(val, np.integer):      # numpy int8/16/32/64
+        return int(val)
+    if isinstance(val, np.floating):     # numpy float32/64
+        v = float(val)
+        return None if (math.isnan(v) or math.isinf(v)) else v
+    if isinstance(val, np.bool_):
+        return bool(val)
+    if hasattr(val, "item"):             # numpy scalar lainnya
+        return val.item()
+    return val
+
+
+def _rows_to_safe_list(records: list[dict]) -> list[dict]:
+    """Pastikan semua nilai dalam list of dict JSON-serializable."""
+    return [
+        {k: _to_json_safe(v) for k, v in row.items()}
+        for row in records
+    ]
+
+
+def _to_scalar(v):
+    """Pastikan v adalah scalar, bukan Series (terjadi saat nama kolom duplikat)."""
+    if hasattr(v, "iloc"):
+        return v.iloc[0] if len(v) > 0 else ""
+    return v
+
+
+def _clean_val(v) -> str:
+    """Bersihkan nilai: hapus 00:00:00, strip nan/NaT."""
+    v = _to_scalar(v)
+    s = str(v).strip()
+    if s.lower() in ("nan", "nat", "none", ""):
+        return ""
+    s = re.sub(r"[\sT]00:00:00(\.\d+)?$", "", s).strip()
+    return s
+
+
+# ============================================================
+# ENDPOINT: Health check + status DB
+# ============================================================
+@app.get("/", tags=["Health"])
+def root():
+    return {"status": "ok", "app": "RU Claim Excel Column Extractor"}
+
+
+@app.get("/health", tags=["Health"])
+def health_check():
+    """Cek status aplikasi dan koneksi database."""
+    db_info = check_db_connection()
+    return {"app": "ok", "database": db_info}
 
 
 # ============================================================
@@ -61,66 +151,103 @@ async def upload_excel(
     - Simpan hasil ke database.
     - Return ringkasan matched / missing / irrelevant.
     """
-    # Validasi ekstensi
+    logger.info("Upload dimulai: '%s'", file.filename)
+
+    # ── Validasi ekstensi ────────────────────────────────────
     if not file.filename.lower().endswith((".xlsx", ".xls")):
         raise HTTPException(
             status_code=400,
             detail="Hanya file .xlsx atau .xls yang diperbolehkan.",
         )
 
-    # Simpan file sementara
+    # ── Baca & validasi ukuran ───────────────────────────────
+    contents  = await file.read()
+    file_size = len(contents)
+    logger.info("Ukuran file: %.2f MB", file_size / (1024 * 1024))
+
+    if file_size == 0:
+        raise HTTPException(status_code=400, detail="File kosong.")
+
+    if file_size > MAX_FILE_SIZE:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"Ukuran file terlalu besar ({file_size / (1024*1024):.1f} MB). "
+                f"Maksimum {MAX_FILE_SIZE // (1024*1024)} MB."
+            ),
+        )
+
+    # ── Simpan file sementara ────────────────────────────────
     unique_name = f"{uuid.uuid4().hex}_{file.filename}"
     file_path   = os.path.join(UPLOAD_DIR, unique_name)
-    contents    = await file.read()
     with open(file_path, "wb") as f:
         f.write(contents)
+    del contents    # bebaskan RAM segera
+    logger.info("File disimpan: %s", unique_name)
 
+    # ── Baca Excel ───────────────────────────────────────────
     try:
-        # ── Baca Excel ──────────────────────────────────────────
-        xl         = pd.ExcelFile(file_path)
+        # Pilih engine sesuai ekstensi, dengan fallback otomatis
+        is_xls     = file.filename.lower().endswith(".xls")
+        engine_try = "xlrd" if is_xls else "openpyxl"
+        engine_fb  = "openpyxl" if is_xls else "xlrd"
+
+        try:
+            xl = pd.ExcelFile(file_path, engine=engine_try)
+        except Exception as e_try:
+            logger.warning("Engine '%s' gagal (%s), coba '%s'", engine_try, e_try, engine_fb)
+            try:
+                xl = pd.ExcelFile(file_path, engine=engine_fb)
+                engine_try = engine_fb
+            except Exception as e_fb:
+                raise ValueError(
+                    f"File tidak bisa dibaca sebagai Excel. "
+                    f"Pastikan file tidak corrupt. Detail: {e_fb}"
+                )
+
         sheet_name = xl.sheet_names[0]
+        logger.info("Sheet: %s (engine: %s)", xl.sheet_names, engine_try)
 
         MIN_REAL_COLS = 4
-        SCAN_ROWS     = 30   # scan maksimal 30 baris pertama untuk cari header
-        df_raw = xl.parse(sheet_name, header=None, dtype=str)
 
-        # Cari header row: baris dengan kolom terisi TERBANYAK di 30 baris pertama.
-        # Ini lebih robust daripada "baris pertama dengan ≥ 4 kolom" karena file
-        # kadang punya baris judul/info di atas header asli.
-        header_row  = 0
-        best_filled = 0
-        scan_limit  = min(SCAN_ROWS, len(df_raw))
-        for i in range(scan_limit):
-            row = df_raw.iloc[i]
+        df_raw = xl.parse(sheet_name, header=None, dtype=str, engine=engine_try)
+        header_row = 0
+
+        for i, row in df_raw.iterrows():
             filled = [
                 c for c in row
                 if pd.notna(c) and str(c).strip() not in ("", "nan")
             ]
-            if len(filled) > best_filled:
-                best_filled = len(filled)
-                header_row  = i
+            if len(filled) >= MIN_REAL_COLS:
+                header_row = i
+                break
 
-        if best_filled < MIN_REAL_COLS:
-            raise ValueError(f"Tidak ditemukan baris header yang valid (kolom terisi < {MIN_REAL_COLS}).")
-
-        # ── Deteksi double-header ────────────────────────────────
-        def _is_subheader_row(row_series) -> bool:
-            vals = [str(v).strip() for v in row_series
-                    if pd.notna(v) and str(v).strip() not in ("", "nan")]
-            return (2 <= len(vals) <= 10 and
-                    all(len(v) <= 15 for v in vals))
+        # ── Deteksi double-header ────────────────────────────
+        def _is_subheader_row(row_series, total_cols: int) -> bool:
+            vals = [
+                str(v).strip() for v in row_series
+                if pd.notna(v) and str(v).strip() not in ("", "nan")
+            ]
+            if not (2 <= len(vals) <= 5):
+                return False
+            if not all(len(v) <= 12 for v in vals):
+                return False
+            fill_ratio = len(vals) / max(total_cols, 1)
+            return fill_ratio < 0.3
 
         next_row_idx = header_row + 1
-        use_double = (
+        total_cols   = len(df_raw.columns)
+        use_double   = (
             next_row_idx < len(df_raw) and
-            _is_subheader_row(df_raw.iloc[next_row_idx])
+            _is_subheader_row(df_raw.iloc[next_row_idx], total_cols)
         )
 
         if use_double:
+            logger.info("Double-header terdeteksi di row %d", next_row_idx)
             row1 = df_raw.iloc[header_row].tolist()
             row2 = df_raw.iloc[next_row_idx].tolist()
 
-            last_parent = ""
+            last_parent   = ""
             parent_filled = []
             for v in row1:
                 vs = str(v).strip() if pd.notna(v) and str(v).strip() not in ("nan",) else ""
@@ -135,21 +262,42 @@ async def upload_excel(
                 ss = str(s).strip() if pd.notna(s) and str(s).strip() not in ("", "nan") else ""
                 headers.append(f"{p} {ss}".strip() if ss else p)
 
-            df = xl.parse(sheet_name, header=None, dtype=str,
-                          skiprows=list(range(next_row_idx + 1)))
-            df.columns = headers[:len(df.columns)]
+            data_start_row = next_row_idx + 1
+            df = xl.parse(
+                sheet_name, header=None, dtype=str,
+                skiprows=list(range(data_start_row)),
+                engine=engine_try,
+            )
+            df.columns = headers[: len(df.columns)]
         else:
-            df      = xl.parse(sheet_name, header=header_row, dtype=str)
+            df      = xl.parse(sheet_name, header=header_row, dtype=str, engine=engine_try)
             headers = [str(c).strip() for c in df.columns.tolist()]
 
         # Bersihkan suffix pandas duplikat (.1, .2, ...)
-        headers = [re.sub(r'\.\d+$', '', h).strip() for h in headers]
-        df.columns = headers[:len(df.columns)]
+        headers    = [re.sub(r"\.\d+$", "", h).strip() for h in headers]
+        df.columns = headers[: len(df.columns)]
 
-        # ── Analisis kolom ───────────────────────────────────────
-        result = analyze_columns(headers)
+        logger.info("Kolom: %d | Contoh: %s", len(headers), headers[:5])
 
-        # ── Simpan ke DB ─────────────────────────────────────────
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Gagal baca Excel '%s': [%s] %s\n%s",
+                     file.filename, type(e).__name__, e, traceback.format_exc())
+        if os.path.exists(file_path):
+            os.remove(file_path)
+        raise HTTPException(
+            status_code=422,
+            detail=f"Gagal membaca file Excel: [{type(e).__name__}] {e}",
+        )
+
+    # ── Analisis kolom ───────────────────────────────────────
+    result = analyze_columns(headers)
+    logger.info("Matched: %d | Missing: %s | Irrelevant: %d",
+                len(result.matched), result.missing, len(result.irrelevant))
+
+    # ── Simpan ke DB ─────────────────────────────────────────
+    try:
         upload = crud.save_upload_result(
             db=db,
             original_name=file.filename,
@@ -158,39 +306,30 @@ async def upload_excel(
             total_columns=len(headers),
             result=result,
         )
-
-        # ── Bersihkan & ambil preview data ───────────────────────
-        def _clean_series(s: pd.Series) -> pd.Series:
-            s = s.fillna("").astype(str).str.strip()
-            s = s.where(~s.str.lower().isin(["nan", "nat", "none"]), "")
-            s = s.str.replace(r'[\sT]00:00:00(\.\d+)?$', '', regex=True).str.strip()
-            return s
-
-        col_map   = {m["column_name"]: m["mapped_to"] for m in result.matched}
-        available = {ec: tn for ec, tn in col_map.items() if ec in df.columns}
-
-        if available:
-            df_out = df[list(available.keys())].copy()
-            for col in df_out.columns:
-                df_out[col] = _clean_series(df_out[col])
-            df_out.rename(columns=available, inplace=True)
-            total_rows = len(df_out)
-            rows = df_out.head(500).to_dict(orient="records")
-        else:
-            rows       = []
-            total_rows = 0
-
-    except HTTPException:
-        raise
+        logger.info("Tersimpan upload_id=%d status=%s", upload.id, upload.status)
     except Exception as e:
-        logger.error("Upload error: %s\n%s", e, traceback.format_exc())
-        # Hapus file jika gagal diproses
+        logger.error("Gagal simpan ke DB: [%s] %s\n%s",
+                     type(e).__name__, e, traceback.format_exc())
         if os.path.exists(file_path):
             os.remove(file_path)
         raise HTTPException(
             status_code=500,
-            detail=f"Gagal memproses file: {str(e)}",
+            detail=f"Gagal menyimpan ke database: [{type(e).__name__}] {e}",
         )
+
+    # ── Ambil preview data ───────────────────────────────────
+    col_map  = {m["column_name"]: m["mapped_to"] for m in result.matched}
+    MAX_ROWS = 1000
+    rows     = []
+    for _, row in df.head(MAX_ROWS).iterrows():
+        row_dict = {}
+        for excel_col, target_name in col_map.items():
+            if excel_col in df.columns:
+                row_dict[target_name] = _clean_val(row[excel_col])
+        rows.append(row_dict)
+
+    rows = _rows_to_safe_list(rows)
+    logger.info("Upload selesai: '%s' -> %d baris", file.filename, len(rows))
 
     return {
         "message": "File berhasil diproses.",
@@ -198,7 +337,7 @@ async def upload_excel(
         "original_name": file.filename,
         "sheet_name": sheet_name,
         "total_columns": len(headers),
-        "total_rows": total_rows,
+        "total_rows": len(df),
         "preview_rows": len(rows),
         "status": upload.status,
         "matched": result.matched,
@@ -271,7 +410,6 @@ def get_column_preview(upload_id: int, db: Session = Depends(get_db)):
     """
     Baca kembali file Excel dan kembalikan isi data (semua baris)
     untuk setiap kolom target yang berhasil di-match.
-    Response: { "Police No": ["val1","val2",...], "Certif": [...], ... }
     """
     upload = crud.get_upload_by_id(db, upload_id)
     if not upload:
@@ -279,28 +417,30 @@ def get_column_preview(upload_id: int, db: Session = Depends(get_db)):
 
     file_path = os.path.join(UPLOAD_DIR, upload.filename)
     if not os.path.exists(file_path):
-        raise HTTPException(status_code=404, detail="File Excel sudah tidak tersedia di server.")
+        raise HTTPException(
+            status_code=404,
+            detail="File Excel sudah tidak tersedia di server.",
+        )
 
     try:
-        xl = pd.ExcelFile(file_path)
+        xl         = pd.ExcelFile(file_path)
         sheet_name = upload.sheet_name or xl.sheet_names[0]
-
-        MIN_REAL_COLS = 4
-        df_raw = xl.parse(sheet_name, header=None, dtype=str)
+        df_raw     = xl.parse(sheet_name, header=None, dtype=str)
         header_row = 0
         for i, row in df_raw.iterrows():
-            filled = [c for c in row if pd.notna(c) and str(c).strip() not in ("", "nan")]
-            if len(filled) >= MIN_REAL_COLS:
+            filled = [
+                c for c in row
+                if pd.notna(c) and str(c).strip() not in ("", "nan")
+            ]
+            if len(filled) >= 4:
                 header_row = i
                 break
-
-        df = xl.parse(sheet_name, header=header_row, dtype=str)
+        df         = xl.parse(sheet_name, header=header_row, dtype=str)
         df.columns = [str(c).strip() for c in df.columns]
-
     except Exception as e:
-        raise HTTPException(status_code=422, detail=f"Gagal membaca file: {str(e)}")
+        logger.error("Preview gagal baca file id=%d: [%s] %s", upload_id, type(e).__name__, e)
+        raise HTTPException(status_code=422, detail=f"Gagal membaca file: {e}")
 
-    # Ambil kolom matched dari DB → { column_name_excel: mapped_to_target }
     matched_cols = {
         c.column_name: c.mapped_to
         for c in upload.columns
@@ -310,15 +450,10 @@ def get_column_preview(upload_id: int, db: Session = Depends(get_db)):
     preview = {}
     for excel_col, target_name in matched_cols.items():
         if excel_col in df.columns:
-            # dtype=str: semua sudah string, bersihkan "nan"/"NaT" dan " 00:00:00"
-            import re as _re2
-            def _clean(v):
-                s = str(v).strip()
-                if s.lower() in ("nan", "nat", "none", ""):
-                    return ""
-                s = _re2.sub(r'[\sT]00:00:00(\.\d+)?$', '', s).strip()
-                return s
-            values = [_clean(v) for v in df[excel_col].fillna("").astype(str).tolist()]
+            values = [
+                _clean_val(v)
+                for v in df[excel_col].fillna("").astype(str).tolist()
+            ]
             preview[target_name] = {
                 "column_name": excel_col,
                 "values": values,
@@ -337,11 +472,3 @@ def delete_history(upload_id: int, db: Session = Depends(get_db)):
     if not success:
         raise HTTPException(status_code=404, detail="Upload tidak ditemukan.")
     return {"message": f"Upload #{upload_id} berhasil dihapus."}
-
-
-# ============================================================
-# Health check
-# ============================================================
-@app.get("/", tags=["Health"])
-def root():
-    return {"status": "ok", "app": "RU Claim Excel Column Extractor"}
