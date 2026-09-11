@@ -188,15 +188,19 @@ async def upload_excel(
         s = _re2.sub(r'[\sT]00:00:00(\.\d+)?$', '', s).strip()
         return s
 
-    # Ambil isi data per kolom target yang matched
+    # Ambil isi data per kolom target yang matched — cara cepat tanpa iterrows
     MAX_ROWS = 1000
+    # Filter hanya kolom yang dibutuhkan
+    existing_cols = [c for c in col_map if c in df.columns]
+    df_subset = df[existing_cols].head(MAX_ROWS)
+
     rows = []
-    for _, row in df.head(MAX_ROWS).iterrows():
+    for i in range(len(df_subset)):
         row_dict = {}
-        for excel_col, target_name in col_map.items():
-            if excel_col in df.columns:
-                val = _to_scalar(row[excel_col])
-                row_dict[target_name] = _clean_val(val)
+        for excel_col in existing_cols:
+            target_name = col_map[excel_col]
+            val = _to_scalar(df_subset[excel_col].iloc[i])
+            row_dict[target_name] = _clean_val(val)
         rows.append(row_dict)
 
     return {
